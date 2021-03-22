@@ -1,0 +1,46 @@
+data:
+  root_dir: /gpfs/users/idrissib/datasets/sleepapnea/raw
+  h5_path: ${data.root_dir}/X_train.h5
+  target_path: ${data.root_dir}/y_train_tX9Br0C.csv
+  batch_size: 256
+
+model:
+  n_classes: 1
+  bilinear: False 
+  # n_channels: 8
+
+loss:
+  balancing: 50
+
+optimizer:
+  lr: 5e-6
+
+trainer:
+  default_root_dir: '.'
+  gpus: 1
+  max_epochs: 200
+  progress_bar_refresh_rate: 1
+  log_every_n_steps: 1
+
+hydra:
+  launcher:
+    timeout_min: 360
+    cpus_per_task: 16
+    gpus_per_node: 1
+    tasks_per_node: 1
+    mem_gb: 64
+    name: ${hydra.job.name}
+    partition: gpu
+    array_parallelism: 4
+  job:
+    env_set:
+      MKL_THREADING_LAYER: GNU
+      MKL_SERVICE_FORCE_INTEL: '1'
+
+defaults:
+  - override hydra/launcher: submitit_slurm
+
+job:
+  lr_finder: False
+
+  
