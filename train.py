@@ -191,8 +191,7 @@ class DreemUnetModule(pl.LightningModule):
 
     def configure_optimizers(self):
         optimizer = torch.optim.Adam(self.parameters(), **self.optimizer_params)
-        return optimizer
-        {
+        return {
           'optimizer': optimizer,
           'lr_scheduler': torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, patience=2),
           'monitor': 'val_loss'
@@ -213,7 +212,7 @@ def app(cfg):
     module = DreemUnetModule(cfg.model, cfg.optimizer, class_weight=cfg.loss.balancing*class_weight)
     
     wandb_logger = pl.loggers.wandb.WandbLogger(project="dreem_challenge", config=OmegaConf.to_container(cfg, resolve=True))
-    checkpoint = ModelCheckpoint(monitor='val_loss')
+    checkpoint = ModelCheckpoint(monitor='val_loss', dirpath='saves/')
     
     indices_train = np.random.choice(3600, 8*12)
     train_vis = SegmentationCallback("train", dataset.all_data[indices_train].to(0), dataset.input_labels[indices_train].to(0), 0, 12, 8, 20)
