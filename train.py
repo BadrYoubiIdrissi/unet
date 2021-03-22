@@ -59,7 +59,7 @@ class DreemDataset(LightningDataModule):
         for j, signal in enumerate(signals):
             col_slice = slice(2+j*9000, 2+(j+1)*9000)
             all_data.append(torch.Tensor(data[:, col_slice]))
-        self.all_data = torch.stack(all_data, dim=1)[:,:6,:]
+        self.all_data = torch.stack(all_data, dim=1)
         # train_stats = self.all_data[:,3600].view(8, -1)
         # self.mean = train_stats.mean(dim=1).view(1,8,1)
         # self.std = train_stats.std(dim=1).view(1,8,1)
@@ -72,15 +72,15 @@ class DreemDataset(LightningDataModule):
         self.val_dataset = TensorDataset(self.all_data[3600:], self.input_labels[3600:])
 
     def train_dataloader(self):
-        return DataLoader(self.train_dataset, batch_size=self.batch_size, num_workers=16, shuffle=True)
+        return DataLoader(self.train_dataset, num_workers=8, batch_sampler=BalancedBatchSampler(self.batch_size, self.all_data[:3600], self.input_labels[:3600]))
     
     def val_dataloader(self):
-        return DataLoader(self.val_dataset, batch_size=self.batch_size, num_workers=16, shuffle=False)
+        return DataLoader(self.val_dataset, batch_size=self.batch_size, num_workers=8)
 
 
 
 class SegmentationCallback(Callback):
-    def __init__(self, name, sample, target, sig_id, width, height) -> None:
+    def __init__(self, name, sample, target, sig_id, width, height, period) -> None:
         super().__init__()
         self.name=name
         self.sample=sample
@@ -90,72 +90,72 @@ class SegmentationCallback(Callback):
         self.width=width
         self.height=height
         assert width*height == self.nb_samples
+        self.counter = 0
+        self.period=period
     def on_epoch_end(self, trainer, pl_module):
         # nb_signals = 4
         # pl_module.eval()
-        count = 0
-        out = pl_module.model(self.sample)
-        pred = out > 0
+        self.counter += 1
+        if (self.counter%self.period)==0:
+          count = 0
+          out = pl_module.model(self.sample)
+          pred = out > 0
 
-        fig = plt.figure()
-        plt.hist(out.view(-1).detach().cpu().numpy(), bins="auto")
-        wandb.log({"hist_predictions_"+self.name: wandb.Image(fig)}, commit=False)
-        plt.close()
+          fig = plt.figure()
+          plt.hist(out.view(-1).detach().cpu().numpy(), bins="auto")
+          wandb.log({"hist_predictions_"+self.name: wandb.Image(fig)}, commit=False)
+          plt.close()
 
-        fig, axs = plt.subplots(self.height,self.width, sharex=True, squeeze=True, figsize=(45,15))
+          fig, axs = plt.subplots(self.height,self.width, sharex=True, squeeze=True, figsize=(45,15))
 
-        with torch.no_grad():
-            for i in range(self.height):
-                for j in range(self.width):
-                    data_sample, labels = self.sample[count,self.sig_id], self.target[count].squeeze()
-                    curr_pred = pred[count].squeeze()
-                    count+=1
-                    x=np.linspace(0, 90, num=9000)
-                    axs[i,j].plot(x, data_sample.detach().cpu().numpy())
-                    axs[i,j].fill_between(x, 0, 1, where=labels.bool().detach().cpu().numpy(),
-                    facecolor='green', linewidth=0.0, alpha=0.2, transform=axs[i,j].get_xaxis_transform())
+          with torch.no_grad():
+              for i in range(self.height):
+                  for j in range(self.width):
+                      data_sample, labels = self.sample[count,self.sig_id], self.target[count].squeeze()
+                      curr_pred = pred[count].squeeze()
+                      count+=1
+                      x=np.linspace(0, 90, num=9000)
+                      axs[i,j].plot(x, data_sample.detach().cpu().numpy())
+                      axs[i,j].fill_between(x, 0, 1, where=labels.bool().detach().cpu().numpy(),
+                      facecolor='green', linewidth=0.0, alpha=0.2, transform=axs[i,j].get_xaxis_transform())
 
-                    axs[i,j].fill_between(x, 0, 1, where=curr_pred.bool().detach().cpu().numpy(),
-                    facecolor='red', linewidth=0.0, alpha=0.2, transform=axs[i,j].get_xaxis_transform())
+                      axs[i,j].fill_between(x, 0, 1, where=curr_pred.bool().detach().cpu().numpy(),
+                      facecolor='red', linewidth=0.0, alpha=0.2, transform=axs[i,j].get_xaxis_transform())
 
-            wandb.log({"sample_predictions_"+self.name: wandb.Image(fig)}, commit=False)
-        plt.close()
-        # pl_module.train()
-
-# def dice_loss(input, target):
-#     smooth = 1e-3
-
-#     iflat = input.view(-1)
-#     tflat = target.view(-1)
-#     intersection = (iflat * tflat).sum()
-    
-#     return 1 - ((2. * intersection + smooth) /
-#               (iflat.sum() + tflat.sum() + smooth))
+              wandb.log({"sample_predictions_"+self.name: wandb.Image(fig)}, commit=False)
+          plt.close()
+          # pl_module.train()
 
 def long_mask_to_short_mask(out):
     return (torch.nn.functional.conv1d(out.float(), torch.ones(1, 1, 100, device=out.device), bias=None, stride=100).squeeze() > 50).long().detach().cpu()
 
+class BalancedBatchSampler(object):
+    def __init__(self, batch_size, data, target):
+        self.all_idx = torch.arange(0, data.size(0))
+        self.idx_pos = torch.masked_select(self.all_idx, target.sum(dim=-1).squeeze()>0)
+        self.idx_neg = torch.masked_select(self.all_idx, target.sum(dim=-1).squeeze()==0)
+        self.half = batch_size//2
+        self.len = data.size(0)//batch_size
+        self.batch_size=batch_size
+
+    def __len__(self): 
+        return self.len
+
+    def __iter__(self):
+        for i in range(self.len):
+            idx_pos_batch = self.idx_pos[torch.randint(0, self.idx_pos.size(0), (self.half,))]
+            idx_neg_batch = self.idx_neg[torch.randint(0, self.idx_pos.size(0), (self.batch_size-self.half,))]
+            yield torch.cat([idx_pos_batch, idx_neg_batch], axis=0).view(-1)
+    
 class DreemUnetModule(pl.LightningModule):
 
     def __init__(self, model_params, optimizer_params, class_weight=1.0):
         super().__init__()
-        # down_sample = nn.Sequential(nn.Conv1d(8, 32, 7, padding=9, dilation=3),
-        #                                  nn.ReLU(), 
-        #                                  nn.MaxPool1d(5), 
-        #                                  nn.Conv1d(32, 64, 7, padding=9, dilation=3), 
-        #                                  nn.ReLU(), 
-        #                                  nn.MaxPool1d(2),
-        #                                  nn.Conv1d(64, 64, 7, padding=9, dilation=3), 
-        #                                  nn.ReLU(), 
-        #                                  nn.MaxPool1d(5), 
-        #                                  nn.Conv1d(64, 64, 7, padding=9, dilation=3), 
-        #                                  nn.ReLU(), 
-        #                                  nn.MaxPool1d(2))
-        unet = UNet(n_channels=6, **model_params)
+        unet = UNet(n_channels=8, **model_params)
         self.model = unet
         self.optimizer_params = optimizer_params
         self.class_weight = class_weight
-        print(summary(self.model, (6, 9000)))
+        print(summary(self.model, (8, 9000)))
 
     def training_step(self, batch, batch_idx):
         x, y = batch
@@ -172,10 +172,10 @@ class DreemUnetModule(pl.LightningModule):
         loss = 1-dice_loss(z, y)
         self.log('val_loss', loss)
         pred = (z>0.5).long()
-        self.log('val_f1_score', torchmetrics.functional.f1(pred.view(-1), y.view(-1).long(), num_classes=2, average="none")[1], on_step=True, on_epoch=True, prog_bar=True)
+        self.log('val_f1_score', torchmetrics.functional.f1(pred.view(-1), y.view(-1).long(), num_classes=2, average="none")[1], on_epoch=True, prog_bar=True)
         # self.log('val_dreem_met', dreem_sleep_apnea_custom_metric(pred.long().squeeze().detach().cpu(), y.squeeze().long().detach().cpu()), on_step=True, on_epoch=True, prog_bar=True)
-        self.log('val_prec_score', torchmetrics.functional.precision(pred.view(-1), y.view(-1).long(), num_classes=2, average="none")[1], on_step=True, on_epoch=True, prog_bar=True)
-        self.log('val_recall_score', torchmetrics.functional.recall(pred.view(-1), y.view(-1).long(), num_classes=2, average="none")[1], on_step=True, on_epoch=True, prog_bar=True)
+        self.log('val_prec_score', torchmetrics.functional.precision(pred.view(-1), y.view(-1).long(), num_classes=2, average="none")[1], on_epoch=True, prog_bar=True)
+        self.log('val_recall_score', torchmetrics.functional.recall(pred.view(-1), y.view(-1).long(), num_classes=2, average="none")[1], on_epoch=True, prog_bar=True)
         return loss
 
     def test_step(self, batch, batch_idx):
@@ -192,11 +192,11 @@ class DreemUnetModule(pl.LightningModule):
     def configure_optimizers(self):
         optimizer = torch.optim.Adam(self.parameters(), **self.optimizer_params)
         return optimizer
-        # {
-        #         'optimizer': optimizer,
-        #         # 'lr_scheduler': torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, patience=2),
-        #         # 'monitor': 'val_loss'
-        #     }
+        {
+          'optimizer': optimizer,
+          'lr_scheduler': torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, patience=2),
+          'monitor': 'val_loss'
+        }
 
 @hydra.main(config_name="config")
 def app(cfg):
@@ -216,10 +216,10 @@ def app(cfg):
     checkpoint = ModelCheckpoint(monitor='val_loss')
     
     indices_train = np.random.choice(3600, 8*12)
-    train_vis = SegmentationCallback("train", dataset.all_data[indices_train].to(0), dataset.input_labels[indices_train].to(0), 0, 12, 8)
+    train_vis = SegmentationCallback("train", dataset.all_data[indices_train].to(0), dataset.input_labels[indices_train].to(0), 0, 12, 8, 20)
     
     indices_val = 3600+np.random.choice(800, 8*12)
-    val_vis = SegmentationCallback("val", dataset.all_data[indices_val].to(0), dataset.input_labels[indices_val].to(0), 0, 12, 8)
+    val_vis = SegmentationCallback("val", dataset.all_data[indices_val].to(0), dataset.input_labels[indices_val].to(0), 0, 12, 8, 20)
 
     trainer = pl.Trainer(logger=wandb_logger, callbacks=[checkpoint, train_vis, val_vis], **cfg.trainer)
     

@@ -13,12 +13,12 @@ class DoubleConv(nn.Module):
         if not mid_channels:
             mid_channels = out_channels
         self.double_conv = nn.Sequential(
-            nn.Conv1d(in_channels, mid_channels, kernel_size=3, padding=1),
+            nn.Conv1d(in_channels, mid_channels, kernel_size=5, dilation=2, padding=4),
             nn.BatchNorm1d(mid_channels),
-            nn.ReLU(inplace=True),
-            nn.Conv1d(mid_channels, out_channels, kernel_size=3, padding=1),
+            nn.ReLU(),
+            nn.Conv1d(mid_channels, out_channels, kernel_size=5, dilation=2, padding=4),
             nn.BatchNorm1d(out_channels),
-            nn.ReLU(inplace=True)
+            nn.ReLU()
         )
 
     def forward(self, x):
@@ -28,10 +28,10 @@ class DoubleConv(nn.Module):
 class Down(nn.Module):
     """Downscaling with maxpool then double conv"""
 
-    def __init__(self, in_channels, out_channels):
+    def __init__(self, in_channels, out_channels,size):
         super().__init__()
         self.maxpool_conv = nn.Sequential(
-            nn.MaxPool1d(2),
+            nn.MaxPool1d(size),
             DoubleConv(in_channels, out_channels)
         )
 
@@ -42,7 +42,7 @@ class Down(nn.Module):
 class Up(nn.Module):
     """Upscaling then double conv"""
 
-    def __init__(self, in_channels, out_channels, bilinear=True):
+    def __init__(self, in_channels, out_channels, size, bilinear=True):
         super().__init__()
 
         # if bilinear, use the normal convolutions to reduce the number of channels
@@ -50,7 +50,7 @@ class Up(nn.Module):
             self.up = nn.Upsample(scale_factor=2, mode='bilinear', align_corners=True)
             self.conv = DoubleConv(in_channels, out_channels, in_channels // 2)
         else:
-            self.up = nn.ConvTranspose1d(in_channels , in_channels // 2, kernel_size=2, stride=2)
+            self.up = nn.ConvTranspose1d(in_channels , out_channels, kernel_size=size, stride=size)
             self.conv = DoubleConv(in_channels, out_channels)
 
 

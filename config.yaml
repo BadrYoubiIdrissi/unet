@@ -1,8 +1,8 @@
 data:
-  root_dir: /gpfs/users/idrissib/datasets/sleepapnea/raw
+  root_dir: /home/byoubi/datasets/sleepapnea
   h5_path: ${data.root_dir}/X_train.h5
   target_path: ${data.root_dir}/y_train_tX9Br0C.csv
-  batch_size: 256
+  batch_size: 128
 
 model:
   n_classes: 1
@@ -13,7 +13,7 @@ loss:
   balancing: 50
 
 optimizer:
-  lr: 5e-6
+  lr: 1e-3
 
 trainer:
   default_root_dir: '.'
@@ -21,6 +21,7 @@ trainer:
   max_epochs: 200
   progress_bar_refresh_rate: 1
   log_every_n_steps: 1
+  check_val_every_n_epoch: 20
 
 hydra:
   launcher:
@@ -41,6 +42,6 @@ defaults:
   - override hydra/launcher: submitit_slurm
 
 job:
-  lr_finder: False
+  lr_finder: True
 
   
