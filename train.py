@@ -220,7 +220,8 @@ class DreemUnetModule(pl.LightningModule):
         optimizer = torch.optim.Adam(self.parameters(), **self.optimizer_params)
         return {
           'optimizer': optimizer,
-          'lr_scheduler': torch.optim.lr_scheduler.StepLR(optimizer, gamma=0.75, step_size=2)
+          'lr_scheduler': torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='max', patience=4),
+          'monitor':'val_f1_score'
         }
 
 @hydra.main(config_name="config")
