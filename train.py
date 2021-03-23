@@ -91,10 +91,14 @@ class DreemDataset(LightningDataModule):
     def train_dataloader(self):
         return DataLoader(self.train_dataset, num_workers=8, batch_sampler=BalancedBatchSampler(self.batch_size, self.all_data[:3600], self.input_labels[:3600]))
     
+    def all_dataloader(self):
+        return DataLoader(self.all_data, batch_size=self.batch_size, num_workers=8)
+
     def val_dataloader(self):
         return DataLoader(self.val_dataset, batch_size=self.batch_size, num_workers=8)
 
-
+    def test_dataloader(self):
+        return DataLoader(self.test_data, batch_size=self.batch_size, num_workers=8)
 
 class SegmentationCallback(Callback):
     def __init__(self, name, sample, target, sig_id, width, height, period) -> None:
@@ -173,6 +177,7 @@ class DreemUnetModule(pl.LightningModule):
         self.optimizer_params = optimizer_params
         self.class_weight = class_weight
         print(summary(self.model, (8, 9000)))
+        self.count = 0
 
     def training_step(self, batch, batch_idx):
         x, y = batch
@@ -192,18 +197,24 @@ class DreemUnetModule(pl.LightningModule):
         self.log('val_loss', loss)
         pred = (z>0.8).long()
         self.log('val_f1_score', torchmetrics.functional.f1(pred.view(-1), y.view(-1).long(), num_classes=2, average="none")[1], on_epoch=True, prog_bar=True)
+        self.log('val_aucroc', torchmetrics.functional.auroc(z.view(-1), y.view(-1).long()), on_epoch=True, prog_bar=True)
         # self.log('val_dreem_met', dreem_sleep_apnea_custom_metric(pred.long().squeeze().detach().cpu(), y.squeeze().long().detach().cpu()), on_step=True, on_epoch=True, prog_bar=True)
         self.log('val_prec_score', torchmetrics.functional.precision(pred.view(-1), y.view(-1).long(), num_classes=2, average="none")[1], on_epoch=True, prog_bar=True)
         self.log('val_recall_score', torchmetrics.functional.recall(pred.view(-1), y.view(-1).long(), num_classes=2, average="none")[1], on_epoch=True, prog_bar=True)
         return loss
 
     def test_step(self, batch, batch_idx):
-        z = self.model(batch).sigmoid()
+        if isinstance(batch, torch.Tensor):
+          x = batch
+        else:
+          x = batch[0]
+        z = self.model(x).sigmoid()
         return z
     
     def test_epoch_end(self, outputs):
         self.test_out = torch.cat(outputs)
-        np.save("test.npy", self.test_out.detach().cpu().numpy())
+        self.count+=1
+        np.save(f"test{self.count}.npy", self.test_out.detach().cpu().numpy())
 
     def configure_optimizers(self):
         optimizer = torch.optim.Adam(self.parameters(), **self.optimizer_params)
@@ -224,10 +235,11 @@ def app(cfg):
     class_weight = neg_labels/pos_labels
     print(f"All labels: {all_labels}, Positive labels: {pos_labels}, Negative Labels: {neg_labels}")
 
-    module = DreemUnetModule(cfg.model, cfg.optimizer, class_weight=cfg.loss.balancing*class_weight)
+    # module = DreemUnetModule.load_from_checkpoint("/content/unet/outputs/2021-03-23/09-10-15/saves/epoch=0-step=13.ckpt", model_params=cfg.model, optimizer_params=cfg.optimizer, class_weight=cfg.loss.balancing*class_weight)
+    module = DreemUnetModule(model_params=cfg.model, optimizer_params=cfg.optimizer, class_weight=cfg.loss.balancing*class_weight)
     
     wandb_logger = pl.loggers.wandb.WandbLogger(project="dreem_challenge", config=OmegaConf.to_container(cfg, resolve=True))
-    checkpoint = ModelCheckpoint(monitor='val_f1_score', dirpath='saves/')
+    checkpoint = ModelCheckpoint(monitor='val_f1_score', dirpath='saves/',mode="max")
     
     indices_train = np.random.choice(3600, 8*12)
     train_vis = SegmentationCallback("train", dataset.all_data[indices_train].to(0), dataset.input_labels[indices_train].to(0), 0, 12, 8, 40)
@@ -246,7 +258,8 @@ def app(cfg):
 
     # Train the model
     trainer.fit(module, dataset)
-    trainer.test(module, dataset)
+    trainer.test(module, dataset.all_dataloader())
+    trainer.test(module, datamodule=dataset)
     return trainer, module, dataset
 
 
