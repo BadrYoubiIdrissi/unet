@@ -169,7 +169,7 @@ class DreemUnetModule(pl.LightningModule):
     def __init__(self, model_params, optimizer_params, class_weight=1.0):
         super().__init__()
         unet = UNet(n_channels=8, **model_params)
-        self.model = nn.Sequential(unet, nn.Conv1d(1, 1, kernel_size=100, stride=100, pad=1))
+        self.model = nn.Sequential(unet, nn.Conv1d(1, 1, kernel_size=100, stride=100, padding=1))
         self.optimizer_params = optimizer_params
         self.class_weight = class_weight
         print(summary(self.model, (8, 9000)))
