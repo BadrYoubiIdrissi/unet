@@ -7,7 +7,7 @@ class DiceCoeff(Function):
 
     def forward(self, input, target):
         self.save_for_backward(input, target)
-        eps = 1e-5
+        eps = 1e-2
         self.inter = torch.dot(input.view(-1), target.view(-1))
         self.union = torch.sum(input) + torch.sum(target) + eps
 

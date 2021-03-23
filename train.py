@@ -18,7 +18,7 @@ from torchsummary import summary
 import torchmetrics
 import wandb
 
-from pytorch_lightning.callbacks import ModelCheckpoint
+from pytorch_lightning.callbacks import ModelCheckpoint, LearningRateMonitor
 from pytorch_lightning.callbacks import Callback
 import matplotlib.pyplot as plt
 import matplotlib
@@ -37,21 +37,18 @@ from dice_loss import dice_loss
 from omegaconf import OmegaConf
 
 class DreemDataset(LightningDataModule):
-    def __init__(self, *args, h5_path=None, target_path=None, batch_size=None, **kwargs):
+    def __init__(self, *args, h5_path=None, h5_test=None, target_path=None, batch_size=None, means=None, stds=None, **kwargs):
         self.h5_path = h5_path
+        self.h5_test = h5_test
         self.target_path = target_path
         self.batch_size = batch_size
+        self.means = means
+        self.stds = stds
         super().__init__()
 
-    def prepare_data(self):
-        # download, split, etc...
-        # only called on 1 GPU/TPU in distributed
-        # (batch, 8, 9000)
-        input_h5 = h5py.File(self.h5_path)
-        if self.target_path is not None:
-            self.input_labels = torch.Tensor(np.repeat(pd.read_csv(self.target_path, index_col="ID").values, 100, axis=1)).unsqueeze(1)
-            # self.input_labels = torch.Tensor(pd.read_csv(self.target_path, index_col="ID").values).unsqueeze(1)
-            # assert self.input_labels.shape[-1] == 9000
+    def load_data(self, path):
+        input_h5 = h5py.File(path)
+        
         signals = ['abdom_belt','airflow','PPG','thorac_belt','snore','SPO2','C4-A1','O2-A1']
 
         data = input_h5["data"] #(batch, all_cols)
@@ -59,13 +56,33 @@ class DreemDataset(LightningDataModule):
         for j, signal in enumerate(signals):
             col_slice = slice(2+j*9000, 2+(j+1)*9000)
             all_data.append(torch.Tensor(data[:, col_slice]))
-        self.all_data = torch.stack(all_data, dim=1)
-        # train_stats = self.all_data[:,3600].view(8, -1)
-        # self.mean = train_stats.mean(dim=1).view(1,8,1)
-        # self.std = train_stats.std(dim=1).view(1,8,1)
-        # self.all_data = (self.all_data.permute(1, 0, 2) - self.mean)/(self.std+1e-10)
-        # logging.info(f"Dataset means :{self.mean.view(-1)}")
-        # logging.info(f"Dataset stds :{self.std.view(-1)}")
+        all_data = torch.stack(all_data, dim=1)
+        return all_data
+
+    def prepare_data(self):
+        # download, split, etc...
+        # only called on 1 GPU/TPU in distributed
+        # (batch, 8, 9000)
+        self.all_data = self.load_data(self.h5_path)
+        print(self.all_data.shape)
+        self.test_data = self.load_data(self.h5_test)
+        if self.target_path is not None:
+            # self.input_labels = torch.Tensor(np.repeat(pd.read_csv(self.target_path, index_col="ID").values, 100, axis=1)).unsqueeze(1)
+            self.input_labels = torch.Tensor(pd.read_csv(self.target_path, index_col="ID").values).unsqueeze(1)
+            # assert self.input_labels.shape[-1] == 9000
+        
+        if self.means is None:
+          train_stats = self.all_data.permute(1, 0, 2).contiguous()
+          train_stats = train_stats[:,:3600].view(8, -1)
+          self.means = train_stats.mean(dim=1)
+          self.stds = train_stats.std(dim=1)
+
+        self.means = self.means.view(1,8,1)
+        self.stds = self.stds.view(1,8,1)
+        self.all_data = (self.all_data - self.means)/(self.stds+1e-10)
+        self.test_data = (self.test_data - self.means)/(self.stds+1e-10)
+        logging.info(f"Dataset means :{self.means.view(-1)}")
+        logging.info(f"Dataset stds :{self.stds.view(-1)}")
         
     def setup(self):
         self.train_dataset = TensorDataset(self.all_data[:3600], self.input_labels[:3600])
@@ -116,10 +133,10 @@ class SegmentationCallback(Callback):
                       count+=1
                       x=np.linspace(0, 90, num=9000)
                       axs[i,j].plot(x, data_sample.detach().cpu().numpy())
-                      axs[i,j].fill_between(x, 0, 1, where=labels.bool().detach().cpu().numpy(),
+                      axs[i,j].fill_between(x, 0, 1, where=np.repeat(labels.bool().detach().cpu().numpy(),100,axis=-1),
                       facecolor='green', linewidth=0.0, alpha=0.2, transform=axs[i,j].get_xaxis_transform())
 
-                      axs[i,j].fill_between(x, 0, 1, where=curr_pred.bool().detach().cpu().numpy(),
+                      axs[i,j].fill_between(x, 0, 1, where=np.repeat(curr_pred.bool().detach().cpu().numpy(),100,axis=-1),
                       facecolor='red', linewidth=0.0, alpha=0.2, transform=axs[i,j].get_xaxis_transform())
 
               wandb.log({"sample_predictions_"+self.name: wandb.Image(fig)}, commit=False)
@@ -152,7 +169,7 @@ class DreemUnetModule(pl.LightningModule):
     def __init__(self, model_params, optimizer_params, class_weight=1.0):
         super().__init__()
         unet = UNet(n_channels=8, **model_params)
-        self.model = unet
+        self.model = nn.Sequential(unet, nn.Conv1d(1, 1, kernel_size=100, stride=100, pad=1))
         self.optimizer_params = optimizer_params
         self.class_weight = class_weight
         print(summary(self.model, (8, 9000)))
@@ -160,7 +177,8 @@ class DreemUnetModule(pl.LightningModule):
     def training_step(self, batch, batch_idx):
         x, y = batch
         z = self.model(x).sigmoid()
-        # loss = F.binary_cross_entropy_with_logits(z.view(-1), y.view(-1), weight=self.class_weight)
+        # z = self.model(x)
+        # loss = F.binary_cross_entropy_with_logits(z.view(-1), y.view(-1), pos_weight=self.class_weight)
         loss = 1-dice_loss(z, y)
         self.log('train_loss', loss)
         return loss
@@ -168,10 +186,11 @@ class DreemUnetModule(pl.LightningModule):
     def validation_step(self, batch, batch_idx):
         x, y = batch
         z = self.model(x).sigmoid()
-        # loss = F.binary_cross_entropy_with_logits(z.view(-1), y.view(-1), weight=self.class_weight)
+        # z = self.model(x)
+        # loss = F.binary_cross_entropy_with_logits(z.view(-1), y.view(-1), pos_weight=self.class_weight)
         loss = 1-dice_loss(z, y)
         self.log('val_loss', loss)
-        pred = (z>0.5).long()
+        pred = (z>0.8).long()
         self.log('val_f1_score', torchmetrics.functional.f1(pred.view(-1), y.view(-1).long(), num_classes=2, average="none")[1], on_epoch=True, prog_bar=True)
         # self.log('val_dreem_met', dreem_sleep_apnea_custom_metric(pred.long().squeeze().detach().cpu(), y.squeeze().long().detach().cpu()), on_step=True, on_epoch=True, prog_bar=True)
         self.log('val_prec_score', torchmetrics.functional.precision(pred.view(-1), y.view(-1).long(), num_classes=2, average="none")[1], on_epoch=True, prog_bar=True)
@@ -179,22 +198,18 @@ class DreemUnetModule(pl.LightningModule):
         return loss
 
     def test_step(self, batch, batch_idx):
-        x, y = batch
-        z = self.model(x)
-        loss = F.binary_cross_entropy_with_logits(z.view(-1), y.view(-1), weight=self.class_weight)
-        self.log('test_loss', loss)
-        pred = (z.squeeze()>0).long()
-        self.log('test_f1_score', torchmetrics.functional.f1(pred.view(-1), y.view(-1), 2, average="none")[1], on_step=True, on_epoch=True, prog_bar=True, logger=True)
-        self.log('test_prec_score', torchmetrics.functional.precision(pred.view(-1), y.view(-1), average="none")[1], on_step=True, on_epoch=True, prog_bar=True, logger=True)
-        self.log('test_recall_score', torchmetrics.functional.recall(pred.view(-1), y.view(-1), average="none")[1], on_step=True, on_epoch=True, prog_bar=True, logger=True)
-        return loss
+        z = self.model(batch).sigmoid()
+        return z
+    
+    def test_epoch_end(self, outputs):
+        self.test_out = torch.cat(outputs)
+        np.save("test.npy", self.test_out.detach().cpu().numpy())
 
     def configure_optimizers(self):
         optimizer = torch.optim.Adam(self.parameters(), **self.optimizer_params)
         return {
           'optimizer': optimizer,
-          'lr_scheduler': torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, patience=2),
-          'monitor': 'val_loss'
+          'lr_scheduler': torch.optim.lr_scheduler.StepLR(optimizer, gamma=0.75, step_size=2)
         }
 
 @hydra.main(config_name="config")
@@ -212,16 +227,18 @@ def app(cfg):
     module = DreemUnetModule(cfg.model, cfg.optimizer, class_weight=cfg.loss.balancing*class_weight)
     
     wandb_logger = pl.loggers.wandb.WandbLogger(project="dreem_challenge", config=OmegaConf.to_container(cfg, resolve=True))
-    checkpoint = ModelCheckpoint(monitor='val_loss', dirpath='saves/')
+    checkpoint = ModelCheckpoint(monitor='val_f1_score', dirpath='saves/')
     
     indices_train = np.random.choice(3600, 8*12)
-    train_vis = SegmentationCallback("train", dataset.all_data[indices_train].to(0), dataset.input_labels[indices_train].to(0), 0, 12, 8, 20)
+    train_vis = SegmentationCallback("train", dataset.all_data[indices_train].to(0), dataset.input_labels[indices_train].to(0), 0, 12, 8, 40)
     
     indices_val = 3600+np.random.choice(800, 8*12)
-    val_vis = SegmentationCallback("val", dataset.all_data[indices_val].to(0), dataset.input_labels[indices_val].to(0), 0, 12, 8, 20)
+    val_vis = SegmentationCallback("val", dataset.all_data[indices_val].to(0), dataset.input_labels[indices_val].to(0), 0, 12, 8, 40)
 
-    trainer = pl.Trainer(logger=wandb_logger, callbacks=[checkpoint, train_vis, val_vis], **cfg.trainer)
-    
+    lr_logger = LearningRateMonitor(logging_interval='step')
+
+    trainer = pl.Trainer(logger=wandb_logger, callbacks=[checkpoint, train_vis, val_vis, lr_logger], **cfg.trainer)
+
     if cfg.job.lr_finder:
         lr_finder = trainer.tuner.lr_find(module, dataset)
         fig = lr_finder.plot(suggest=True)
@@ -229,6 +246,8 @@ def app(cfg):
 
     # Train the model
     trainer.fit(module, dataset)
+    trainer.test(module, dataset)
+    return trainer, module, dataset
 
 
 if __name__ == "__main__":
